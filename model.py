@@ -30,28 +30,35 @@ class Policy(nn.Module):
 
         num_actions = len(self.action_map)
         self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=128, nhead=8, dim_feedforward=100), 2, norm=None)
-        self.fc = nn.Linear(128, num_actions)
+
+        self.policy = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_actions)
+        )
+
+        self.value = nn.Sequential(
+            nn.Linear(128 * self.MAX_ENTITIES, 400),
+            nn.ReLU(),
+            nn.Linear(400, 100),
+            torch.nn.ReLU(),
+            nn.Linear(100, 1)
+        )
 
         self.softmax = nn.Softmax(-1)
    
-    '''
-    {
-        halite
-        obstruction
-        entities
-    }
-    '''
-
     def device(self):
         return next(self.parameters()).device
 
         
-    def forward(self, state):
+    def forward(self, state, mask = False):
         # Scalar encoding
+        state = self.parse_state(state)
         scalar = state['scalar'].to(self.device())
         scalar_encoding = F.relu(self.scalar_encoder(scalar)).unsqueeze(1)
     
         # Spatial Encoding
+        
         game_map = state['map'].to(self.device())
         map_encoding = self.map(game_map).unsqueeze(1)
         
@@ -59,52 +66,64 @@ class Policy(nn.Module):
         entity_typ = state['entity_typ'].to(self.device())
         entity_pos = state['entity_pos'].to(self.device())
         entity_scalar = state['entity_scalar'].to(self.device())
-
         entity_encodings = self.entity(entity_typ, entity_pos, entity_scalar)
 
         embeddings = map_encoding + entity_encodings + scalar_encoding
 
         set_embedding =  self.transformer(embeddings)
         
-        out = self.fc(set_embedding)
-       
-        return self.softmax(out)
+        out = self.policy(set_embedding)
 
-    def action(self, state):
-        t_state = self.parse_state(state)
-        out = self.forward(t_state)
-
-        raw_actions = Categorical(probs=out[0]).sample()
-        # raw_actions = torch.argmax(out, -1)[0]
-        actions = {}
-
-        n_entities = len(t_state['entity_id'])
-
-        mask = torch.tensor([1] * n_entities + [0] * (self.MAX_ENTITIES - n_entities)).to(self.device())
-
+        if mask == True:
+            lens = []
+            for eid in state['entity_id']:
+                n_entities = len(eid)
+                lens.append(torch.tensor([1] * n_entities + [0] * (self.MAX_ENTITIES - n_entities)))
+            m = torch.stack(lens).to(self.device())
+            return self.softmax(out), m
         
-        # TODO: Migrate this code to env helper
-        for e, eid in enumerate(t_state['entity_id']):
-            act = self.action_map[raw_actions[e]]
+        return self.softmax(out)        
 
-            typ = t_state['entity_typ'][0][e]
-            if typ == self.SHIP_TYPE and act == "SPAWN":
-                act = None
-            elif typ == self.SHIPYARD_TYPE and (act != "SPAWN" and act != None):
-                act = None
-            elif typ == 0:
-                continue
+    def action(self, states):
+        if not isinstance(states, list):
+            states = [states]
+        
+        t_states = self.parse_state(states)
+        out = self.forward(states)
 
-            if act == "SPAWN":
-                if n_entities < self.MAX_ENTITIES:
-                    n_entities += 1
-                else:
+        actions_iter = []
+        raw_actions_iter = []
+        for i, state in enumerate(states):
+            raw_actions = Categorical(probs=out[i]).sample()
+            actions = {}
+
+            n_entities = len(t_states['entity_id'][i])
+
+            # TODO: Migrate this code to env helper
+            for e, eid in enumerate(t_states['entity_id'][i]):
+                act = self.action_map[raw_actions[e]]
+
+                typ = t_states['entity_typ'][i][e]
+                if typ == self.SHIP_TYPE and act == "SPAWN":
                     act = None
-            
-            if act is not None:
-                actions[eid] = act
-   
-        return actions, out, raw_actions, mask
+                elif typ == self.SHIPYARD_TYPE and (act != "SPAWN" and act != None):
+                    act = None
+                elif typ == 0:
+                    continue
+
+                if act == "SPAWN":
+                    if n_entities < self.MAX_ENTITIES:
+                        n_entities += 1
+                    else:
+                        act = None
+                
+                if act is not None:
+                    actions[eid] = act
+
+            actions_iter.append(actions)
+            raw_actions_iter.append(raw_actions)
+    
+        return actions_iter, raw_actions_iter
 
 
 class ParseState(object):
@@ -123,75 +142,99 @@ class ParseState(object):
         self.starting_halite = config['startingHalite']
         self.max_entities = max_entities
 
-    def __call__(self, s):
-        step = s['step']
+    def __call__(self, states):
 
-        halite = torch.tensor(s['halite']).float()
-        halite = halite.reshape(self.map_size, self.map_size, 1) / self.max_halite
-        obstruction = torch.zeros(self.map_size**2).float()
-
-        me = s['players'][0]
-        my_halite, my_shipyards, my_ships = tuple(me)
+        if not isinstance(states, list):
+            states = [states]
         
-        scalar = torch.zeros(len(s['players']))
 
-        scalar[0] = my_halite
+        spat_map_iter = []
+        entity_typ_iter = []
+        entity_pos_iter = []
+        entity_id_iter = []
+        entity_scalar_iter = []
+        scalar_iter = []
 
+        for s in states:
+            step = s['step']
 
-        entity_typ = []
-        entity_pos = []
-        entity_scalar = []
-        entity_id = []
+            halite = torch.tensor(s['halite']).float()
+            halite = halite.reshape(self.map_size, self.map_size, 1) / self.max_halite
+            obstruction = torch.zeros(self.map_size**2).float()
 
-        for shipyard_id, shipyard_pos in my_shipyards.items():
-            obstruction[shipyard_pos] = 1.0
-            x = int(shipyard_pos % self.map_size)
-            y = int(shipyard_pos / self.map_size)
-            entity_typ.append(1)
-            entity_pos.append([x,y])
-            entity_scalar.append([0])
-            entity_id.append(shipyard_id)
+            me = s['players'][s['player']]
+            my_halite, my_shipyards, my_ships = tuple(me)
+            
+            scalar = torch.zeros(len(s['players']))
 
-
-        for ship_id, ship_pos in my_ships.items():
-            obstruction[ship_pos[0]] = 1.0
-            x = int(ship_pos[0] % self.map_size)
-            y = int(ship_pos[0] / self.map_size)
-            entity_typ.append(2)
-            entity_pos.append([x,y])
-            entity_scalar.append([ship_pos[1]])
-            entity_id.append(ship_id)
+            scalar[0] = my_halite
 
 
-        opponents = s['players'][1:]
+            entity_typ = []
+            entity_pos = []
+            entity_scalar = []
+            entity_id = []
 
-        for i, opponent in enumerate(opponents):
-            opp_halite, opp_shipyards, opp_ships = tuple(opponent)
-            scalar[i+1] = opp_halite
-            for shipyard_pos in opp_shipyards.values():
+            for shipyard_id, shipyard_pos in my_shipyards.items():
                 obstruction[shipyard_pos] = 1.0
-            for ship_pos in opp_ships.values():
+                x = int(shipyard_pos % self.map_size)
+                y = int(shipyard_pos / self.map_size)
+                entity_typ.append(1)
+                entity_pos.append([x,y])
+                entity_scalar.append([0])
+                entity_id.append(shipyard_id)
+
+
+            for ship_id, ship_pos in my_ships.items():
                 obstruction[ship_pos[0]] = 1.0
+                x = int(ship_pos[0] % self.map_size)
+                y = int(ship_pos[0] / self.map_size)
+                entity_typ.append(2)
+                entity_pos.append([x,y])
+                entity_scalar.append([ship_pos[1]])
+                entity_id.append(ship_id)
 
-        obstruction = obstruction.reshape(self.map_size, self.map_size, 1)
-    
-        spat_map = torch.cat((halite, obstruction), 2).unsqueeze(0).permute(0,3,1,2)
 
-        n_entities = len(entity_id)
-        diff = self.max_entities - n_entities
+            opponents = s['players']
 
-        entity_typ = F.pad(torch.tensor(entity_typ).long().unsqueeze(0), (0, diff), "constant", 0)
-        entity_pos =  F.pad(torch.tensor(entity_pos).long().unsqueeze(0), (0, 0, 0, diff), "constant", 0)
-        entity_scalar =  F.pad(torch.tensor(entity_scalar).float().unsqueeze(0), (0, 0, 0, diff), "constant", 0)
+            scalar_loc = 1
+            for i, opponent in enumerate(opponents):
+                if i != s['player']:
+                    opp_halite, opp_shipyards, opp_ships = tuple(opponent)
+                    scalar[scalar_loc] = opp_halite
+                    for shipyard_pos in opp_shipyards.values():
+                        obstruction[shipyard_pos] = 1.0
+                    for ship_pos in opp_ships.values():
+                        obstruction[ship_pos[0]] = 1.0
+                    scalar_loc += 1
+
+            obstruction = obstruction.reshape(self.map_size, self.map_size, 1)
         
-        scalar = scalar.unsqueeze(0) / self.starting_halite
+            spat_map = torch.cat((halite, obstruction), 2).unsqueeze(0).permute(0,3,1,2)
+
+            n_entities = len(entity_id)
+            diff = self.max_entities - n_entities
+
+            entity_typ = F.pad(torch.tensor(entity_typ).long().unsqueeze(0), (0, diff), "constant", 0)
+            entity_pos =  F.pad(torch.tensor(entity_pos).long().unsqueeze(0), (0, 0, 0, diff), "constant", 0)
+            entity_scalar =  F.pad(torch.tensor(entity_scalar).float().unsqueeze(0), (0, 0, 0, diff), "constant", 0)
+            
+            scalar = scalar.unsqueeze(0) / self.starting_halite
+
+            spat_map_iter.append(spat_map)
+            entity_typ_iter.append(entity_typ)
+            entity_pos_iter.append(entity_pos)
+            entity_id_iter.append(entity_id)
+            entity_scalar_iter.append(entity_scalar)
+            scalar_iter.append(scalar)
+
         return {
-            'map': spat_map,
-            'entity_typ': entity_typ,
-            'entity_pos': entity_pos,
-            'entity_scalar': entity_scalar,
-            'entity_id': entity_id,
-            'scalar': scalar
+            'map': torch.cat(spat_map_iter),
+            'entity_typ': torch.cat(entity_typ_iter),
+            'entity_pos': torch.cat(entity_pos_iter),
+            'entity_scalar': torch.cat(entity_scalar_iter),
+            'entity_id': entity_id_iter,
+            'scalar': torch.cat(scalar_iter)
         }
  
 
@@ -223,7 +266,7 @@ class EntityEmbedding(nn.Module):
         self.EntityType.weight.data.uniform_(-0.1, .1)
 
     def forward(self, typ, pos, scalar):
-        return self.EntityType(typ) + self.EntityPosition(pos) + F.relu(self.fc(scalar))
+        return self.EntityType(typ) + self.EntityPosition(pos) + self.fc(scalar)
 
 
 # Retrieved from pytorch website

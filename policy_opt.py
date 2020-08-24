@@ -11,6 +11,79 @@ from model import ParseState, Policy
 import argparse
 import torch.multiprocessing as mp
 
+class Expierence():
+    def __init__(self, n_procs, policy):
+        self.policy = policy
+        self.q = mp.Queue(maxsize=n_procs)
+        self.n_procs = n_procs
+
+        self.processes = []
+        for _ in range(self.n_procs):
+            p = mp.Process(target=Expierence.play_episode, args=(policy, self.q))
+            p.start()
+            self.processes.append(p)
+    
+    @staticmethod
+    def play_episode(policy, queue):
+        env = make("halite", debug=True)
+        agents = [None, "random", "random", "random"]
+        with torch.no_grad():
+            while True:
+                agents = agents[:]
+                random.shuffle(agents)
+                trainer = env.train(agents)
+                s = trainer.reset()
+                states = []
+                actions = []
+                rewards = []
+                terminal = False
+                while not terminal:
+                    a, r_a = policy.action(s)
+                    s_, r, terminal, info = trainer.step(a[0])
+                    states.append(s)
+                    actions.append(r_a[0].detach().tolist())
+                    del r_a
+                    rewards.append(r)
+                
+                    s = s_
+                queue.put((states, actions, rewards))
+    
+    def get_batch(self, n):
+        states, actions, rewards = [], [], []
+
+        pbar = tqdm(desc='Fetching Episode Batch', total=n, leave=False)
+        for _ in range(n):
+            s, a, r = self.q.get()
+            states.append(s)
+            actions.append(a)
+            rewards.append(r)
+            pbar.update()
+        
+        pbar.clear()
+        pbar.close()
+
+        return states, actions, rewards
+    
+    def restart(self):
+        self.termintate()
+
+        self.processes = []
+        for _ in range(self.n_procs):
+            p = mp.Process(target=Expierence.play_episode, args=(policy, self.q))
+            p.start()
+            self.processes.append(p)
+
+    def termintate(self):
+        for p in self.processes:
+            p.terminate()
+            p.join()
+
+def get_baseline(rewards):
+    b = []
+    for i, r in enumerate(rewards):
+        b.append(sum(rewards[0:i+1]) * 1.0 / (i+1))
+    return b
+
 def discounted_rewards(rewards, gamma):
     out = []
     acc = 0.0
@@ -19,100 +92,86 @@ def discounted_rewards(rewards, gamma):
         out.insert(0, acc)
     return out
 
-def train_epoch(trainer, policy, optimizer, device):
+def train_epoch(epoch, policy, exp, optimizer, device, writer, args):
     optimizer.zero_grad()
-    batch_size = 16
+    batch_size = args.batch_episodes
 
-    episode_log_probs = []
-    episode_entropy = []
-    pbar = tqdm(desc='Train Batch', total=batch_size, leave=False)
+    states, actions, rewards = exp.get_batch(batch_size)
 
 
-    # with mp.Pool(8) as p:
-    #     print(p.starmap(play_episode, [(policy, device,)] * batch_size))
-
-    train_queue = mp.Queue(maxsize=8)
-    processes = []
-
-
-    for _ in range(8):
-        p = mp.Process(target=play_episode, args=(policy, device, train_queue))
-        p.start()
-        processes.append(p)
+    sar = zip(states, actions, rewards)
+    loss_avg = 0.0
     
+    pbar = tqdm(desc='Accumulating Gradients', total=batch_size, leave=False)
+
+    avg_rewards = 0
+    for s, a, r in sar:
+        probs, mask = policy(s, mask=True)
+        probs = probs + 1e-7
+
+        a = torch.tensor(a)
+        actions = F.one_hot(a, 7).to(device)
+        mask = mask.float()
+        masked_log_prob = torch.log(probs) * actions * mask.unsqueeze(-1)
     
-    for _ in range(batch_size):
-        train_queue.get()
-        # episode_log_probs.append(lp)
-        # episode_entropy.append(ent)
+        masked_log_prob = torch.sum(masked_log_prob, (1,2))
+
+        baseline = get_baseline(r)
+        rewards = discounted_rewards(r, args.gamma)
+        baseline = torch.tensor(baseline).float().to(device)
+        rewards = torch.tensor(rewards).float().to(device)
+        rewards = rewards - baseline
+
+        weighted_log_prob = rewards * masked_log_prob
+       
+        weighted_log_prob = -1.0 * torch.mean(weighted_log_prob, -1)
+
+
+        # entropy
+        beta = args.beta
+        entropy = beta * torch.mean(torch.sum(probs * torch.log(probs), (1,2)))
+       
+        loss = (weighted_log_prob + entropy)/batch_size
+        loss_avg += loss.item()
+        loss.backward()
         pbar.update()
+        avg_rewards += sum(r)*1.0 / batch_size
     
-    for p in processes:
-        p.terminate()
-        p.join()
-
+    nn.utils.clip_grad_norm_(policy.parameters(), args.clip)
+    optimizer.step()
+    
     pbar.clear()
     pbar.close()
 
-    # loss = -1.0 * torch.stack(episode_log_probs).mean()
-    # loss += 1e-2 * torch.stack(episode_entropy).mean()
-    # loss.backward()
-    # optimizer.step()
-
-def play_episode(policy, device, queue):
-    env = make("halite", debug=True)
-    trainer = env.train([None, "random", "random", "random"])
-    with torch.no_grad():
-        while True:
-            
-            s = trainer.reset()
-
-            actions = []
-            probs = []
-            rewards = []
-            base = []
-            masks = []
-
-            terminal = False
-            while not terminal:
-                a, l_a, r_a, m = policy.action(s)
-                s_, r, terminal, info = trainer.step(a)
-                
-                rewards.append(r)
-                base.append(sum(rewards)/len(rewards))
-                actions.append(r_a.detach())
-                # probs.append(l_a)
-                # masks.append(m)
-
-                s = s_
-            queue.put((rewards, base, actions))
-            continue 
-            probs = torch.cat(probs) + 1e-7
-            actions = F.one_hot(torch.stack(actions), 7)
-            mask = torch.stack(masks).float()
+    writer.add_scalar('Loss', loss_avg, epoch)
+    writer.add_scalar('Rewards', avg_rewards, epoch)
 
 
-            masked_log_prob = torch.log(probs) * actions * mask.unsqueeze(-1)
-            # (T, E, A)
-
-            masked_log_prob = torch.sum(masked_log_prob, (1,2))
-            
-            rewards = discounted_rewards(rewards, .99)
-            rewards = torch.tensor(rewards).float().to(device)
-            rewards = rewards - torch.tensor(base).float().to(device)
-
-            weighted_log_prob = rewards * masked_log_prob
-            weighted_log_prob = torch.sum(weighted_log_prob, -1)
-
-            queue.put(rewards.detach())
+    for s, a, r in sar:
+        for s_ in s:
+            del s_
+        for a_ in a:
+            del a_
+        for r_ in r:
+            del r_
+    del sar
+        
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--players", default=4, type=int,
                         help="Number of players in halite [default: 4]")
-    parser.add_argument("--n_episodes", default=32, type=int,
-                        help="Batch size [default: 32]")
+    parser.add_argument("--batch_episodes", default=128, type=int,
+                        help="Batch size [default: 64]")
+    parser.add_argument("--gamma", default=.99, type=float,
+                        help="Gamma value [default: .99]")
+    parser.add_argument("--beta", default=1e-2, type=float,
+                        help="Entropy Beta value [default: 1e-2]")
+    parser.add_argument("--lr", default=1e-3, type=float,
+                        help="Learning rate [default: 1e-3]")
+    parser.add_argument("--clip", default=1e-1, type=float,
+                        help="Grad clip [default: 1e-1]")
     # parser.add_argument("--lr", default=1e-3, type=float,
     #                     help="Learning rate [default: 20]")
     # parser.add_argument("--epoch", default=100, type=int,
@@ -120,34 +179,32 @@ if __name__ == "__main__":
     # parser.add_argument("--device", type=int,
     #                     help="GPU card ID to use (if not given, use CPU)")
     # parser.add_argument("--seed", default=42, type=int,
+
     #                     help="Random seed [default: 42]")
     args = parser.parse_args()
-    
     env = make("halite", debug=True)
-
-    print(env.configuration)
-
-    # Training agent in first position (player 1) against the default random agent.
-    trainer = env.train([None, "random", "random", "random"])
-
    
     device = 'cuda:0'
     policy = Policy(env.configuration, args.players).to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-2, weight_decay=0)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, weight_decay=0)
 
     policy.share_memory()
     torch.multiprocessing.set_start_method('spawn')
 
-    n_epochs = 50
-    pbar = tqdm(desc='Train Epoch', total=n_epochs, leave=False)
-    for i in range(n_epochs):
-        train_epoch(trainer, policy, optimizer, device)
-        pbar.update()
+    exp = Expierence(8, policy)
 
-        f = open('./index.html', 'w')
-        f.write(env.render(mode='html', width=400, height=600))
-        f.close()
+    writer = SummaryWriter()
+
+    n_epochs = 100
+    try:
+        pbar = tqdm(desc='Train Epoch', total=n_epochs, leave=False)
+        for i in range(n_epochs):
+            train_epoch(i, policy, exp, optimizer, device, writer, args)
+            pbar.update()
+
+        pbar.clear()
+        pbar.close()
+    finally:
+        exp.termintate()
     
-    pbar.clear()
-    pbar.close()
    
